@@ -32,9 +32,11 @@ pub(super) enum Secret {
     Live { report: SecretState, holds: u32 },
     /// `clear_now` ran: no clone of its write is written again, whatever it last reported.
     Cancelled { report: SecretState, holds: u32 },
-    /// `clear_now` ran and a clipboard has been wiped since. It reports `Cleared` from here on,
-    /// even if another clipboard turns out to have been replaced.
-    Swept { holds: u32 },
+    /// `clear_now` ran and a clipboard has been wiped, but others have yet to settle.
+    Sweeping { report: SecretState, holds: u32 },
+    /// `clear_now` ran, it wiped something, and every clipboard has settled: `Cleared`, even if
+    /// one of them turned out to have been replaced.
+    Swept,
 }
 impl Default for Secret {
     fn default() -> Self { Self::Live { report: SecretState::Pending, holds: 0 } }
@@ -42,8 +44,8 @@ impl Default for Secret {
 impl Secret {
     fn report(&self) -> SecretState {
         match self {
-            Self::Live { report, .. } | Self::Cancelled { report, .. } => report.clone(),
-            Self::Swept { .. } => SecretState::Cleared,
+            Self::Live { report, .. } | Self::Cancelled { report, .. } | Self::Sweeping { report, .. } => report.clone(),
+            Self::Swept => SecretState::Cleared,
         }
     }
 }
@@ -56,6 +58,8 @@ pub(super) enum SecretEvent {
     Held,
     /// A clipboard's hold ended, with this outcome.
     Released(SecretState),
+    /// A clipboard holding this copy was dropped.
+    Abandoned,
     /// A write of this copy failed; the latest report stands.
     Report(SecretState),
     /// The last clone of its write was dropped.
@@ -72,21 +76,39 @@ pub(super) fn step(secret: &mut Secret, event: SecretEvent) -> Effects<SecretEff
     use {Secret::*, SecretEvent::*};
     let ask = |holds: u32| if holds > 0 { Effects::one(SecretEffect::Clear) } else { Effects::none() };
     let less = |holds: u32| holds.saturating_sub(1);
+    let none = Effects::none;
     let (next, effects) = match (std::mem::take(secret), event) {
-        (Live { report, holds } | Cancelled { report, holds }, Cancel) => (Cancelled { report, holds }, ask(holds)),
-        (Swept { holds }, Cancel) => (Swept { holds }, ask(holds)),
-        (Live { holds, .. }, Held) => (Live { report: SecretState::Holding, holds: holds + 1 }, Effects::none()),
-        (Cancelled { holds, .. }, Held) => (Cancelled { report: SecretState::Holding, holds: holds + 1 }, Effects::none()),
-        (Swept { holds }, Held) => (Swept { holds: holds + 1 }, Effects::none()),
-        (Live { holds, .. }, Released(report)) => (Live { report, holds: less(holds) }, Effects::none()),
-        (Cancelled { holds, .. } | Swept { holds }, Released(SecretState::Cleared)) => (Swept { holds: less(holds) }, Effects::none()),
-        (Cancelled { holds, .. }, Released(report)) => (Cancelled { report, holds: less(holds) }, Effects::none()),
-        (Swept { holds }, Released(_)) => (Swept { holds: less(holds) }, Effects::none()),
-        (Live { holds, .. }, Report(report)) => (Live { report, holds }, Effects::none()),
-        (Cancelled { holds, .. }, Report(report)) => (Cancelled { report, holds }, Effects::none()),
-        (Live { report: SecretState::Pending, holds }, Dropped) => (Live { report: SecretState::Replaced, holds }, Effects::none()),
-        (Cancelled { report: SecretState::Pending, holds }, Dropped) => (Cancelled { report: SecretState::Cleared, holds }, Effects::none()),
-        (unchanged, Report(_) | Dropped) => (unchanged, Effects::none()),
+        (Live { report, holds } | Cancelled { report, holds }, Cancel) => {
+            // Another clipboard expiring doesn't make this one clear yet.
+            let report = if holds > 0 && report == SecretState::Cleared { SecretState::Holding } else { report };
+            (Cancelled { report, holds }, ask(holds))
+        }
+        (Sweeping { report, holds }, Cancel) => (Sweeping { report, holds }, ask(holds)),
+        (Swept, Cancel) => (Swept, none()),
+        (Live { holds, .. }, Held) => (Live { report: SecretState::Holding, holds: holds + 1 }, none()),
+        (Cancelled { holds, .. }, Held) => (Cancelled { report: SecretState::Holding, holds: holds + 1 }, none()),
+        (Sweeping { holds, .. }, Held) => (Sweeping { report: SecretState::Holding, holds: holds + 1 }, none()),
+        (Swept, Held) => (Sweeping { report: SecretState::Holding, holds: 1 }, none()),
+        (Live { holds, .. }, Released(report)) => (Live { report, holds: less(holds) }, none()),
+        (Cancelled { report, holds }, Released(outcome)) => (match (less(holds), outcome) {
+            (0, SecretState::Cleared) => Swept,
+            (0, outcome) => Cancelled { report: outcome, holds: 0 },
+            (holds, SecretState::Cleared) => Sweeping { report, holds },
+            (holds, _) => Cancelled { report, holds },
+        }, none()),
+        (Sweeping { report, holds }, Released(_) | Abandoned) => (match less(holds) {
+            0 => Swept,
+            holds => Sweeping { report, holds },
+        }, none()),
+        (Swept, Released(_) | Abandoned) => (Swept, none()),
+        (Live { report, holds }, Abandoned) => (Live { report, holds: less(holds) }, none()),
+        (Cancelled { report, holds }, Abandoned) => (Cancelled { report, holds: less(holds) }, none()),
+        (Live { holds, .. }, Report(report)) => (Live { report, holds }, none()),
+        (Cancelled { holds, .. }, Report(report)) => (Cancelled { report, holds }, none()),
+        (Sweeping { holds, .. }, Report(report)) => (Sweeping { report, holds }, none()),
+        (Live { report: SecretState::Pending, holds }, Dropped) => (Live { report: SecretState::Replaced, holds }, none()),
+        (Cancelled { report: SecretState::Pending, holds }, Dropped) => (Cancelled { report: SecretState::Cleared, holds }, none()),
+        (unchanged, Report(_) | Dropped) => (unchanged, none()),
     };
     *secret = next;
     effects
@@ -103,10 +125,14 @@ impl Slot {
     pub(super) fn set(&self, state: SecretState) { self.step(SecretEvent::Report(state)); }
     pub(super) fn held(&self) { self.step(SecretEvent::Held); }
     pub(super) fn released(&self, state: SecretState) { self.step(SecretEvent::Released(state)); }
+    pub(super) fn abandoned(&self) { self.step(SecretEvent::Abandoned); }
     pub(super) fn cancelled(&self) -> bool { !matches!(*lock(&self.secret), Secret::Live { .. }) }
     pub(super) fn bind(&self, route: Route) {
         let mut routes = lock(&self.routes);
-        if !routes.iter().any(|r| r.same(&route)) { routes.push(route); }
+        routes.retain(|r| !r.gone());
+        if routes.iter().any(|r| r.same(&route)) { return; }
+        let route = if routes.is_empty() { route } else { route.later() };
+        routes.push(route);
     }
     fn state(&self) -> SecretState { lock(&self.secret).report() }
 }

@@ -10,7 +10,7 @@
 //! RTF-only clipboard (TextEdit, Notes, Pages) is converted to HTML there too.
 use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 use std::time::Duration;
 use crate::time::Instant;
 use zeroize::Zeroizing;
@@ -76,20 +76,34 @@ impl std::fmt::Debug for ClipboardWrite {
 }
 
 #[derive(Clone)]
-enum Route { System(Arc<mpsc::Sender<Request>>), Memory(MemoryClipboard) }
+enum Route {
+    System(Arc<mpsc::Sender<Request>>),
+    Memory(MemoryClipboard),
+    /// A memory clipboard a secret reached after its first: the secret doesn't keep it alive.
+    LaterMemory(Weak<Mutex<Memory>>),
+}
 impl Route {
-    /// Whether both lead to the same clipboard.
-    fn same(&self, other: &Route) -> bool {
-        match (self, other) {
-            (Route::System(a), Route::System(b)) => Arc::ptr_eq(a, b),
-            (Route::Memory(a), Route::Memory(b)) => Arc::ptr_eq(&a.0, &b.0),
-            _ => false,
+    fn id(&self) -> *const () {
+        match self {
+            Route::System(worker) => Arc::as_ptr(worker).cast(),
+            Route::Memory(m) => Arc::as_ptr(&m.0).cast(),
+            Route::LaterMemory(m) => m.as_ptr().cast(),
         }
     }
+    /// Whether both lead to the same clipboard.
+    fn same(&self, other: &Route) -> bool { self.id() == other.id() }
+    fn later(self) -> Route {
+        match self {
+            Route::Memory(m) => Route::LaterMemory(Arc::downgrade(&m.0)),
+            route => route,
+        }
+    }
+    fn gone(&self) -> bool { matches!(self, Route::LaterMemory(m) if m.strong_count() == 0) }
     fn send(&self, request: Request) {
         match self {
             Route::System(worker) => { let _ = worker.send(request); }
             Route::Memory(m) => m.handle(request),
+            Route::LaterMemory(m) => if let Some(m) = m.upgrade() { MemoryClipboard(m).handle(request); },
         }
     }
 }
@@ -315,6 +329,12 @@ impl WriteSteps for RealTime {
 /// The clipboard owner's bookkeeping, shared by the OS worker and the memory clipboard.
 #[derive(Default)]
 struct Core { keys: RandomState, seq: Seq, hold: Hold, alarm: Option<Alarm>, own_pills: Option<OwnPills> }
+impl Drop for Core {
+    /// A dropped clipboard takes its contents with it, so its hold is settled.
+    fn drop(&mut self) {
+        if let Hold::Holding { slot, .. } = &self.hold { slot.abandoned(); }
+    }
+}
 impl Core {
     fn next_check(&self) -> Option<Instant> {
         self.hold.next_check(Instant::now() + WATCH)

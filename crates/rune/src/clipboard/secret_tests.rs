@@ -14,7 +14,7 @@ const PILLS: &str = "a <span data-pill=\"agent:x\">@x</span> b";
 
 /// The logic before the machines, kept as it was: a state, a cancel flag beside it, and a held
 /// record per clipboard. Only `clear_now` is new: it asks every clipboard still holding the
-/// secret, each cleared on its own, and a wipe after it settles the report as cleared.
+/// secret, each cleared on its own, and reports cleared once they have all settled.
 mod flags {
     use super::*;
 
@@ -30,12 +30,14 @@ mod flags {
     }
     impl Slot {
         pub fn set(&self, state: SecretState) {
-            *lock(&self.state) = if self.wiped_after_cancel.load(Ordering::SeqCst) { SecretState::Cleared } else { state };
+            let settled = self.wiped_after_cancel.load(Ordering::SeqCst) && self.holders.load(Ordering::SeqCst) == 0;
+            *lock(&self.state) = if settled { SecretState::Cleared } else { state };
         }
-        fn released(&self, state: SecretState) {
-            self.holders.fetch_sub(1, Ordering::SeqCst);
-            if state == SecretState::Cleared && self.cancel.load(Ordering::SeqCst) { self.wiped_after_cancel.store(true, Ordering::SeqCst); }
-            self.set(state);
+        fn released(&self, outcome: SecretState) {
+            let left = self.holders.fetch_sub(1, Ordering::SeqCst) - 1;
+            if !self.cancel.load(Ordering::SeqCst) { return self.set(outcome); }
+            if outcome == SecretState::Cleared { self.wiped_after_cancel.store(true, Ordering::SeqCst); }
+            if left == 0 { self.set(outcome); }
         }
     }
 
@@ -65,6 +67,9 @@ mod flags {
         pub fn clear_now(&self) {
             self.0.cancel.store(true, Ordering::SeqCst);
             if self.0.holders.load(Ordering::SeqCst) == 0 { return; }
+            let mut state = lock(&self.0.state);
+            if *state == SecretState::Cleared { *state = SecretState::Holding; }
+            drop(state);
             for route in lock(&self.0.routes).iter() { let _ = route.send(self.0.clone()); }
         }
     }
@@ -370,6 +375,8 @@ enum Ev {
     ShutdownA,
     /// The workers reach the clears `clear_now` queued. Until then, reads are ahead of them.
     Pump,
+    /// Only A's worker does.
+    PumpA,
     /// The app's own copies of the writes go away.
     DropWrites,
 }
@@ -477,6 +484,13 @@ impl<E: Engine> Rig<E> {
         });
     }
 
+    fn pump(&mut self, b: usize) {
+        let queued: Vec<_> = self.queues[b].1.try_iter().collect();
+        for request in queued {
+            if self.turn(b) { self.engines[b].run(&mut self.boards[b], request); }
+        }
+    }
+
     fn apply(&mut self, ev: Ev) where E::Copy: 'static {
         match ev {
             WriteSA => self.write(0, self.s_write.clone()),
@@ -529,12 +543,8 @@ impl<E: Engine> Rig<E> {
                 self.engines[0].clear_held(&mut self.boards[0]);
                 self.alive[0] = false;
             },
-            Pump => for b in 0..2 {
-                let queued: Vec<_> = self.queues[b].1.try_iter().collect();
-                for request in queued {
-                    if self.turn(b) { self.engines[b].run(&mut self.boards[b], request); }
-                }
-            },
+            Pump => for b in 0..2 { self.pump(b); },
+            PumpA => self.pump(0),
             DropWrites => { self.s_write = None; self.t_write = None; self.forever_write = None; }
         }
     }
@@ -571,6 +581,9 @@ fn check(sequence: &[Ev], counted: [bool; 2], start: Instant) -> Result<(), Stri
         machines.apply(ev);
         reference.apply(ev);
         same(&machines, &reference).map_err(|why| format!("{:?} with change counts {counted:?}, after event {i}: {why}", sequence))?;
+        if machines.s.0.cancelled() && machines.s.state() == SecretState::Cleared && (0..2).any(|b| machines.alive[b] && machines.boards[b].ours()) {
+            return Err(format!("{sequence:?} with change counts {counted:?}, after event {i}: reported Cleared with the secret still held"));
+        }
     }
     keeps_clear_nows_promise(&mut machines, &mut reference).map_err(|why| format!("{:?} with change counts {counted:?}, then clear_now: {why}", sequence))
 }
@@ -638,7 +651,7 @@ fn exhaust(alphabet: &[Ev], len: u32, counted: [bool; 2]) -> usize {
 const COUNTS: [[bool; 2]; 2] = [[true, false], [false, true]];
 
 /// Writes and replays across boards against everything that can end a hold.
-const BOARDS: &[Ev] = &[WriteSA, WriteSB, WriteTA, ReadA, ReadB, CancelS, Pump, Timeout, OtherA, OtherB, ClearHeldA, ToggleFailA];
+const BOARDS: &[Ev] = &[WriteSA, WriteSB, WriteTA, ReadA, ReadB, CancelS, Pump, PumpA, Timeout, OtherA, OtherB, ClearHeldA, ToggleFailA];
 /// Interruptions during a write, against what follows them on the same board.
 const IN_FLIGHT: &[Ev] = &[WriteSA, WriteSASlow, WriteSASlowHash, WriteSACancelInWrite, WriteSAOtherInWrite, WriteSACancelOtherInWrite, WriteSACancelInWake, ReadA, CancelS, Pump, OtherA, ToggleFailA, Timeout];
 /// How a copy's life ends: shutdown, dropped writes, pills, a look-alike from another app.
@@ -659,16 +672,23 @@ fn every_six_events_ending_a_copy_match_the_flags() {
     exhaust_all(ENDINGS);
 }
 
-/// The whole alphabet at once; too long for the normal run. Run with `--ignored --release`.
+/// The whole alphabet at once; too long for the normal run. Run with `--ignored`, one test per job.
+const ALL: &[Ev] = &[
+    WriteSA, WriteSB, WriteTA, WriteForeverA, WritePillsA, WriteSASlow, WriteSASlowHash, WriteSACancelInWrite, WriteSAOtherInWrite, WriteSACancelOtherInWrite, WriteSACancelInWake,
+    ReadA, ReadB, CancelS, Timeout, OtherA, OtherB, OtherSameText, ToggleFailA, ClearHeldA, ShutdownA, Pump, PumpA, DropWrites,
+];
+
+fn exhaust_whole_alphabet(counted: [bool; 2]) {
+    for len in 1..=6 { assert_eq!(exhaust(ALL, len, counted), ALL.len().pow(len)); }
+}
+
 #[test]
 #[ignore]
-fn every_six_events_from_the_whole_alphabet_match_the_flags() {
-    const ALL: &[Ev] = &[
-        WriteSA, WriteSB, WriteTA, WriteForeverA, WritePillsA, WriteSASlow, WriteSASlowHash, WriteSACancelInWrite, WriteSAOtherInWrite, WriteSACancelOtherInWrite, WriteSACancelInWake,
-        ReadA, ReadB, CancelS, Timeout, OtherA, OtherB, OtherSameText, ToggleFailA, ClearHeldA, ShutdownA, Pump, DropWrites,
-    ];
-    exhaust_all(ALL);
-}
+fn every_six_events_from_the_whole_alphabet_with_a_counted_first_board() { exhaust_whole_alphabet(COUNTS[0]); }
+
+#[test]
+#[ignore]
+fn every_six_events_from_the_whole_alphabet_with_a_counted_second_board() { exhaust_whole_alphabet(COUNTS[1]); }
 
 /// Runs `sequence` through the machines and hands back the rig to look at.
 fn run(sequence: &[Ev]) -> Rig<Core> {
@@ -748,7 +768,8 @@ fn cancel_latches_in_every_report_and_asks_for_a_clear_only_while_a_board_holds_
         for holds in [0, 1] {
             for mut secret in [Secret::Live { report: report.clone(), holds }, Secret::Cancelled { report: report.clone(), holds }] {
                 let effects = step(&mut secret, SecretEvent::Cancel);
-                assert_eq!(secret, Secret::Cancelled { report: report.clone(), holds });
+                let settled = if holds > 0 && report == SecretState::Cleared { SecretState::Holding } else { report.clone() };
+                assert_eq!(secret, Secret::Cancelled { report: settled, holds });
                 let expected = if holds > 0 { Effects::one(SecretEffect::Clear) } else { Effects::none() };
                 assert_eq!(effects, expected);
             }
@@ -778,6 +799,46 @@ fn clear_now_wipes_every_board_a_clone_reached() {
 fn clear_now_reaches_a_later_board_after_the_first_was_replaced() {
     let rig = run(&[WriteSA, WriteSB, OtherA, ReadA, CancelS, Pump]);
     assert_eq!((text_of(&rig.boards[0]), text_of(&rig.boards[1]), rig.s.state()), (Some("theirs"), None, SecretState::Cleared));
+}
+
+#[test]
+fn clear_now_reports_cleared_only_once_every_board_has_settled() {
+    let rig = run(&[WriteSA, WriteSB, CancelS, PumpA]);
+    assert_eq!((text_of(&rig.boards[0]), text_of(&rig.boards[1]), rig.s.state()), (None, Some(SECRET), SecretState::Holding));
+    let rig = run(&[WriteSA, WriteSB, CancelS, PumpA, Pump]);
+    assert_eq!((text_of(&rig.boards[1]), rig.s.state()), (None, SecretState::Cleared));
+    let rig = run(&[WriteSA, WriteSB, Timeout, ReadA, CancelS]);
+    assert_eq!((text_of(&rig.boards[1]), rig.s.state()), (Some(SECRET), SecretState::Holding), "A's expiry doesn't clear B");
+}
+
+/// A secret on `a` then `b`, as a cloned write puts it.
+fn on_two_boards(a: &MemoryClipboard, b: &MemoryClipboard) -> (ClipboardWrite, SecretCopy) {
+    let (write, handle) = ClipboardWrite::secret(SECRET.into(), LONG);
+    write.bind(Route::Memory(a.clone()));
+    a.handle(Request::Write(write.clone(), None));
+    write.bind(Route::Memory(b.clone()));
+    b.handle(Request::Write(write.clone(), None));
+    (write, handle)
+}
+
+#[test]
+fn a_secret_doesnt_keep_a_later_board_alive() {
+    let (a, b) = (memory(), memory());
+    let (write, handle) = on_two_boards(&a, &b);
+    a.set_text("theirs");
+    let board = Arc::downgrade(&b.0);
+    drop(b);
+    assert!(board.upgrade().is_none(), "dropped with the secret's handles still around");
+    drop((write, handle));
+}
+
+#[test]
+fn a_dropped_board_doesnt_hold_up_the_report() {
+    let (a, b) = (memory(), memory());
+    let (_write, handle) = on_two_boards(&a, &b);
+    drop(b);
+    handle.clear_now();
+    assert_eq!((a.text().map(|t| t.to_string()), handle.state()), (None, SecretState::Cleared));
 }
 
 #[test]
