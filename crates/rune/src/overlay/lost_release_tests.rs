@@ -10,6 +10,9 @@
 //! arrives, but an Up may still arrive late. With no monitor running and nothing held, winit can
 //! also dispatch a click nothing saw. A `mouseMoved:` means no button is down, so a held press
 //! doesn't hear it; any other move reaches the drag.
+//!
+//! The target is what dev does. Each place the reference means to depart from it says so with
+//! `differs from dev:`.
 
 use super::*;
 use crate::platform::macos::PointerState;
@@ -18,7 +21,6 @@ use std::sync::atomic::AtomicUsize;
 
 type Point = (f32, f32);
 
-const LENGTH: usize = 6;
 const SLOP: f32 = 4.0;
 const UNSEEN_UP_GRACE: Duration = Duration::from_millis(100);
 const QUEUED_UP_GRACE: Duration = Duration::from_secs(2);
@@ -78,6 +80,8 @@ struct Reference {
     next_press_under_way: bool,
     last_read: Option<Point>,
     pending: Option<Point>,
+    /// `pending` is a deferred hover.
+    pending_hover: bool,
     holding: bool,
     /// The runtime holds a press the monitor never saw, and when the button was last read down.
     armed: bool,
@@ -103,7 +107,7 @@ enum Outcome { Illegal, Passed, Failed(&'static str, String) }
 impl Reference {
     fn new(plan: Plan, runtime_at: Point) -> Self {
         Self { plan, clock: Duration::ZERO, queue: VecDeque::new(), seen: 0, owner: vec![0], ups: vec![None], rose: vec![None], latest: vec![point(0, false)],
-            buttons: 0, at: point(0, false), next_press_under_way: false, last_read: None, pending: None, holding: false, armed: false, checked: Duration::ZERO, rising: None, rebounded: false,
+            buttons: 0, at: point(0, false), next_press_under_way: false, last_read: None, pending: None, pending_hover: false, holding: false, armed: false, checked: Duration::ZERO, rising: None, rebounded: false,
             owed: false, given_up: 0, occluded: false, drag: None, runtime_at, run: None, open: None, last_press: None }
     }
 
@@ -121,6 +125,7 @@ impl Reference {
         if !self.holding && !self.armed { return None; }
         match self.rising {
             Some(since) => Some(since + if self.live().any(|click| !click.down) { QUEUED_UP_GRACE } else { UNSEEN_UP_GRACE }),
+            // differs from dev: a press nothing saw is checked on, so its lost Up is noticed.
             None if self.armed => Some(self.checked + UNSEEN_PRESS_CHECK),
             None => None,
         }
@@ -139,6 +144,7 @@ impl Reference {
         if self.last_read != Some(self.at) {
             self.last_read = Some(self.at);
             self.pending = Some(self.at);
+            self.pending_hover = false;
         }
         (self.buttons, self.at, self.clock)
     }
@@ -182,6 +188,10 @@ impl Reference {
     fn before_position(&mut self, expect: &mut Vec<Heard>) {
         if let Some(front) = self.queue.iter_mut().find(|click| !click.forgotten) && std::mem::take(&mut front.owes) { self.owed = true; }
         self.land_lost(expect);
+    }
+
+    fn forget_hover(&mut self) {
+        if std::mem::take(&mut self.pending_hover) { self.pending = None; }
     }
 
     fn position(&mut self, at: Point, expect: &mut Vec<Heard>) {
@@ -233,29 +243,41 @@ impl Reference {
                 // winit reports a click's position just before the click.
                 let point = match self.queue.front() { Some(click) => click.at, None => self.event(self.plan.far_readings, self.seen) };
                 self.before_position(&mut expect);
+                self.forget_hover();
                 self.position(point, &mut expect);
                 at = Some(point);
             }
             Letter::Hover => {
                 let point = self.event(true, self.seen + 1);
                 (self.buttons, self.at, at) = (0, point, Some(point));
+                // differs from dev: `mouseMoved:` shows the button is up, and a held press doesn't
+                // hear it. Dev reports it to the drag.
                 if self.holding || self.armed { self.button_up(self.latest[self.seen]); }
                 self.before_position(&mut expect);
-                if self.holding || self.armed { self.pending = Some(point); } else { self.position(point, &mut expect); }
+                if self.holding || self.armed {
+                    (self.pending, self.pending_hover) = (Some(point), true);
+                } else {
+                    self.forget_hover();
+                    self.position(point, &mut expect);
+                }
             }
             Letter::UnseenDown => {
                 if self.holding || !self.queue.is_empty() { return None; }
+                // As on dev, the press lands at winit's last position, whatever ends before it.
+                let down = self.runtime_at;
+                // differs from dev: dev replaces the held press with no end; here it's cancelled.
                 self.owed |= self.armed;
                 self.land_lost(&mut expect);
+                self.forget_hover();
                 self.seen += 1;
                 self.next_press_under_way = false;
-                let down = self.runtime_at;
                 self.ups.push(None);
                 self.rose.push(None);
                 self.latest.push(down);
                 (self.armed, self.checked, self.rising, self.rebounded) = (true, self.clock, None, false);
                 let clicks = match self.run { Some((was, count)) if within_slop(was, down) => count + 1, _ => 1 };
                 self.run = Some((down, clicks));
+                self.runtime_at = down;
                 self.drag = Some(Predicted { press: self.seen, down, moved: false });
                 expect.push(Heard::Down(down, clicks));
                 self.buttons = 1;
@@ -279,6 +301,7 @@ impl Reference {
                 let Some(click) = click else { return None };
                 self.owed |= click.owes;
                 self.land_lost(&mut expect);
+                self.forget_hover();
                 let clicks = match self.run { Some((was, count)) if within_slop(was, click.at) => count + 1, _ => 1 };
                 self.run = Some((click.at, clicks));
                 self.runtime_at = click.at;
@@ -306,6 +329,7 @@ impl Reference {
             Letter::Turn => {
                 reading = Some(self.read());
                 self.before_position(&mut expect);
+                // differs from dev for `armed`: dev reports samples to a press nothing saw.
                 let ahead = (self.holding || self.armed) && (self.rising.is_some() || self.rebounded || self.live().next().is_some());
                 if !ahead && let Some(point) = self.pending.take() { self.position(point, &mut expect); }
             }
@@ -392,8 +416,10 @@ fn drive(overlay: &mut Overlay<u32>, pointer: &PointerState, letter: Letter, pla
         Letter::SeenDown => pointer.record_click(true, at.0, at.1),
         Letter::SeenUp => pointer.record_click(false, at.0, at.1),
         Letter::ReadUp | Letter::ReadDown | Letter::Grace => read(pointer),
-        Letter::CursorMoved => overlay.native_moved(pointer, false, at.0, at.1, base + played.clock),
-        Letter::Hover => overlay.native_moved(pointer, true, at.0, at.1, base + played.clock),
+        Letter::CursorMoved | Letter::Hover => {
+            pointer.saw_motion(letter == Letter::Hover, at);
+            overlay.native_moved(pointer, at.0, at.1, base + played.clock);
+        }
         Letter::MouseDown | Letter::UnseenDown => overlay.native_left(pointer, true, base + played.clock),
         Letter::MouseUp | Letter::UnseenUp => {
             overlay.native_left(pointer, false, base + played.clock);
@@ -455,7 +481,7 @@ fn run(overlay: &mut Overlay<u32>, plan: Plan, sequence: &[Letter]) -> Outcome {
 #[derive(Default)]
 struct Tally { ran: usize, failures: BTreeMap<&'static str, (usize, String)> }
 
-fn visit(overlay: &mut Overlay<u32>, plan: Plan, sequence: &mut Vec<Letter>, tally: &mut Tally) {
+fn visit(overlay: &mut Overlay<u32>, plan: Plan, sequence: &mut Vec<Letter>, length: usize, tally: &mut Tally) {
     match run(overlay, plan, sequence) {
         Outcome::Illegal => return,
         Outcome::Passed => tally.ran += 1,
@@ -465,16 +491,15 @@ fn visit(overlay: &mut Overlay<u32>, plan: Plan, sequence: &mut Vec<Letter>, tal
             entry.0 += 1;
         }
     }
-    if sequence.len() == LENGTH { return; }
+    if sequence.len() == length { return; }
     for letter in ALPHABET {
         sequence.push(letter);
-        visit(overlay, plan, sequence, tally);
+        visit(overlay, plan, sequence, length, tally);
         sequence.pop();
     }
 }
 
-#[test]
-fn every_short_sequence_of_pointer_events_keeps_the_drag_invariants() {
+fn walk(length: usize) {
     let jobs: Vec<(Plan, Letter)> = PLANS.iter().flat_map(|plan| ALPHABET.iter().map(|letter| (*plan, *letter))).collect();
     let next = AtomicUsize::new(0);
     let total = Mutex::new(Tally::default());
@@ -484,7 +509,7 @@ fn every_short_sequence_of_pointer_events_keeps_the_drag_invariants() {
             let mut overlay = overlay();
             let mut tally = Tally::default();
             while let Some((plan, letter)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                visit(&mut overlay, *plan, &mut vec![*letter], &mut tally);
+                visit(&mut overlay, *plan, &mut vec![*letter], length, &mut tally);
             }
             let mut total = total.lock().unwrap();
             total.ran += tally.ran;
@@ -495,10 +520,17 @@ fn every_short_sequence_of_pointer_events_keeps_the_drag_invariants() {
         });
     });
     let total = total.into_inner().unwrap();
-    println!("{} sequences up to length {LENGTH}", total.ran);
+    println!("{} sequences up to length {length}", total.ran);
     assert!(total.ran > 100_000, "only {} sequences were legal", total.ran);
     assert!(total.failures.is_empty(), "{} sequences, failures: {:#?}", total.ran, total.failures);
 }
+
+#[test]
+fn every_short_sequence_of_pointer_events_keeps_the_drag_invariants() { walk(5); }
+
+#[test]
+#[ignore = "about 4 million sequences; run by hand after changing the pointer machine"]
+fn every_sequence_to_length_six_keeps_the_drag_invariants() { walk(6); }
 
 /// An overlay with the pointer at (10, 10), and a panel that has read it there.
 fn at_rest() -> (Overlay<u32>, PointerState, Instant) {
@@ -509,6 +541,12 @@ fn at_rest() -> (Overlay<u32>, PointerState, Instant) {
     pointer.read(0, now, (10.0, 10.0), true, false);
     heard(&mut overlay);
     (overlay, pointer, now)
+}
+
+/// AppKit sends the panel an event and winit reports it at once.
+fn moved(overlay: &mut Overlay<u32>, pointer: &PointerState, hover: bool, at: Point, now: Instant) {
+    pointer.saw_motion(hover, at);
+    overlay.native_moved(pointer, at.0, at.1, now);
 }
 
 #[test]
@@ -545,7 +583,7 @@ fn hover_during_the_grace_waits_for_the_release_and_keeps_the_run() {
     overlay.native_left(&pointer, true, now);
     assert_eq!(heard(&mut overlay), [Heard::Down((10.0, 10.0), 1)]);
     pointer.read(0, now, (10.0, 10.0), true, false);
-    overlay.native_moved(&pointer, true, 50.0, 10.0, now);
+    moved(&mut overlay, &pointer, true, (50.0, 10.0), now);
     assert_eq!(heard(&mut overlay), [], "the drag doesn't hear a move made with the button up");
     let due = pointer.deadline(None, false).unwrap();
     pointer.read(0, due, (10.0, 10.0), true, false);
@@ -562,7 +600,7 @@ fn a_hover_with_no_sample_yet_starts_the_grace_at_the_press() {
     pointer.record_click(true, 20.0, 10.0);
     overlay.native_left(&pointer, true, now);
     heard(&mut overlay);
-    overlay.native_moved(&pointer, true, 50.0, 10.0, now);
+    moved(&mut overlay, &pointer, true, (50.0, 10.0), now);
     assert_eq!(heard(&mut overlay), []);
     assert_eq!(pointer.deadline(None, false), Some(now + UNSEEN_UP_GRACE));
 }
@@ -574,6 +612,77 @@ fn a_drag_move_during_the_grace_still_reaches_the_drag() {
     overlay.native_left(&pointer, true, now);
     heard(&mut overlay);
     pointer.read(0, now, (30.0, 10.0), true, false); // a reading can lead the queued drag events
-    overlay.native_moved(&pointer, false, 25.0, 10.0, now);
+    moved(&mut overlay, &pointer, false, (25.0, 10.0), now);
     assert_eq!(heard(&mut overlay), [Heard::Move((25.0, 10.0))]);
+}
+
+#[test]
+fn a_deferred_hover_never_moves_the_next_stationary_drag() {
+    let (mut overlay, pointer, now) = at_rest();
+    overlay.turn_position(&pointer);
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_left(&pointer, true, now);
+    heard(&mut overlay);
+    pointer.read(0, now, (10.0, 10.0), true, false);
+    moved(&mut overlay, &pointer, true, (50.0, 10.0), now);
+    pointer.record_click(true, 10.0, 10.0);
+    moved(&mut overlay, &pointer, false, (10.0, 10.0), now);
+    overlay.native_left(&pointer, true, now);
+    assert_eq!(heard(&mut overlay), [Heard::Cancel((10.0, 10.0)), Heard::Down((10.0, 10.0), 2)]);
+    pointer.read(1, now, (10.0, 10.0), true, false);
+    assert_eq!(overlay.turn_position(&pointer), None, "the old hover is gone");
+    assert_eq!(heard(&mut overlay), []);
+}
+
+#[test]
+fn a_late_drag_move_is_told_from_the_hover_behind_it_by_its_own_event() {
+    let (mut overlay, pointer, now) = at_rest();
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_left(&pointer, true, now);
+    heard(&mut overlay);
+    // winit was busy: AppKit sent a drag, then a hover, and winit reports them afterwards.
+    pointer.saw_motion(false, (25.0, 10.0));
+    pointer.saw_motion(true, (50.0, 10.0));
+    overlay.native_moved(&pointer, 25.0, 10.0, now);
+    assert_eq!(heard(&mut overlay), [Heard::Move((25.0, 10.0))], "the drag's own move still reaches it");
+    overlay.native_moved(&pointer, 50.0, 10.0, now);
+    assert_eq!(heard(&mut overlay), []);
+}
+
+#[test]
+fn a_drag_and_a_hover_at_the_same_point_keep_their_order() {
+    let (mut overlay, pointer, now) = at_rest();
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_left(&pointer, true, now);
+    heard(&mut overlay);
+    pointer.saw_motion(false, (25.0, 10.0));
+    pointer.saw_motion(true, (25.0, 10.0));
+    overlay.native_moved(&pointer, 25.0, 10.0, now);
+    assert_eq!(heard(&mut overlay), [Heard::Move((25.0, 10.0))]);
+    assert!(pointer.take_motion_hover((25.0, 10.0)), "the hover is still next");
+}
+
+#[test]
+fn a_move_no_event_accounts_for_reaches_the_drag() {
+    let (mut overlay, pointer, now) = at_rest();
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_left(&pointer, true, now);
+    heard(&mut overlay);
+    pointer.saw_motion(true, (90.0, 10.0));
+    overlay.native_moved(&pointer, 25.0, 10.0, now);
+    assert_eq!(heard(&mut overlay), [Heard::Move((25.0, 10.0))], "unproven hover never suppresses a drag");
+    assert!(!pointer.take_motion_hover((90.0, 10.0)), "and what was noted can't be matched up any more");
+}
+
+#[test]
+fn an_unseen_press_that_replaces_a_lost_one_lands_where_winit_put_it() {
+    let (mut overlay, pointer, now) = at_rest();
+    overlay.native_left(&pointer, true, now);
+    heard(&mut overlay);
+    pointer.read(0, now, (10.0, 10.0), true, false);
+    moved(&mut overlay, &pointer, false, (50.0, 10.0), now);
+    assert_eq!(heard(&mut overlay), [Heard::Move((50.0, 10.0))], "with no monitor, as on dev");
+    overlay.native_left(&pointer, true, now);
+    assert_eq!(heard(&mut overlay), [Heard::Cancel((10.0, 10.0)), Heard::Down((50.0, 10.0), 1)]);
+    assert_eq!(overlay.rt.pointer(), Some((50.0, 10.0)));
 }

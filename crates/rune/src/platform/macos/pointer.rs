@@ -1,17 +1,43 @@
 //! Overlay pointer sampling, hit testing, and native mouse monitors.
 
-use std::{cell::{Cell, RefCell}, time::{Duration, Instant}};
+use std::{cell::{Cell, RefCell}, collections::VecDeque, time::{Duration, Instant}};
 use objc2::{ClassType, msg_send, msg_send_id, rc::Retained};
 use objc2_app_kit::{NSEvent, NSPanel, NSScreen, NSWindow};
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint};
 use crate::{OverlayInput, OverlaySupport};
 use super::{Panel, cursor::set_ns_cursor, geometry::{contains_pointer, screen_id}, hold::{self, Effect, Event, Hold, Point}};
 
+/// A position still to report. A hover waited out a press, so a newer press or position drops it.
+#[derive(Clone, Copy)]
+enum Pending { Sampled(Point), Hover(Point) }
+
+/// Enough for any burst AppKit hands winit in one turn.
+const MOTIONS: usize = 32;
+
+/// Notes an event AppKit is sending the panel that winit will report a position for. winit may
+/// report it later, when `NSApp.currentEvent` is already a different one.
+pub(super) fn note_motion(panel: &NSPanel, event: &NSEvent) {
+    const MOUSE_MOVED: usize = 5;
+    // Left and right down and up, moved, left and right dragged, scroll, other down, up and dragged.
+    const REPORTED: [usize; 11] = [1, 2, 3, 4, MOUSE_MOVED, 6, 7, 22, 25, 26, 27];
+    let Some(pointer) = super::panel_bridge::pointer_state(panel) else { return };
+    // SAFETY: `sendEvent:` runs on AppKit's main thread; the event is only read here.
+    let (kind, point): (usize, NSPoint) = unsafe { (msg_send![event, type], msg_send![event, locationInWindow]) };
+    if !REPORTED.contains(&kind) { return; }
+    let frame = panel.frame();
+    let at = (point.x as f32, (frame.size.height - point.y) as f32);
+    // winit drops a `mouseMoved:` off its view.
+    if kind == MOUSE_MOVED && !(at.0 >= 0.0 && at.1 >= 0.0 && at.0 <= frame.size.width as f32 && at.1 <= frame.size.height as f32) { return; }
+    pointer.saw_motion(kind == MOUSE_MOVED, at);
+}
+
 #[derive(Default)]
 pub(crate) struct PointerState {
     input: Cell<OverlayInput>,
     regions: RefCell<Vec<[f32; 4]>>,
-    pending: Cell<Option<(f32, f32)>>,
+    pending: Cell<Option<Pending>>,
+    /// Events sent to the panel that winit hasn't reported yet: whether each was `mouseMoved:`.
+    motions: RefCell<VecDeque<(bool, Point)>>,
     hold: RefCell<Hold>,
     last: Cell<Option<(f32, f32)>>,
     inside: Cell<bool>,
@@ -72,6 +98,7 @@ impl PointerState {
     /// winit dispatched a press or release: a lost release to land before it, and its point.
     pub(crate) fn take_edge(&self, down: bool) -> (Option<Point>, Option<Point>) {
         let point = self.step(Event::Dispatched { down });
+        if down { self.forget_hover(); }
         (self.recovered_release.take(), point)
     }
     /// A lost release to land before a position winit or a sample is about to report.
@@ -81,14 +108,15 @@ impl PointerState {
     }
     /// The sampled position to report, unless a click it's newer than is still on its way.
     pub(crate) fn take_position(&self) -> Option<Point> {
-        if self.hold.borrow().ahead_of_clicks() { None } else { self.pending.take() }
+        if self.hold.borrow().ahead_of_clicks() { return None; }
+        self.pending.take().map(|(Pending::Sampled(at) | Pending::Hover(at))| at)
     }
     /// One reading of the button and pointer. True if the position is new.
     pub(crate) fn read(&self, buttons: usize, now: Instant, at: Point, inside: bool, display_changed: bool) -> bool {
         self.observe_release(buttons, now, at);
         let was_inside = self.inside.replace(inside);
         if !(inside || was_inside || self.captured() || display_changed) || self.last.replace(Some(at)) == Some(at) { return false; }
-        self.pending.set(Some(at));
+        self.pending.set(Some(Pending::Sampled(at)));
         true
     }
     pub(crate) fn released(&self) { self.step(Event::Released); }
@@ -99,8 +127,29 @@ impl PointerState {
     pub(crate) fn hovered(&self, now: Instant, at: Point) -> bool {
         self.step(Event::Hovered { now });
         let held = self.hold.borrow().holds_press();
-        if held { self.pending.set(Some(at)); }
+        if held { self.pending.set(Some(Pending::Hover(at))); }
         held
+    }
+    /// A newer press or position: a hover waiting for the last press is out of date.
+    pub(crate) fn forget_hover(&self) {
+        if matches!(self.pending.get(), Some(Pending::Hover(_))) { self.pending.set(None); }
+    }
+    /// AppKit is sending the panel an event winit will report a position for.
+    pub(crate) fn saw_motion(&self, hover: bool, at: Point) {
+        if self.input.get() == OverlayInput::None { return; }
+        let mut motions = self.motions.borrow_mut();
+        if motions.len() == MOTIONS { motions.pop_front(); }
+        motions.push_back((hover, at));
+    }
+    /// Whether the position winit reports came from a `mouseMoved:`. One no event accounts for
+    /// isn't proven to be, and whatever was noted can't be matched up any more.
+    pub(crate) fn take_motion_hover(&self, at: Point) -> bool {
+        let mut motions = self.motions.borrow_mut();
+        let close = |p: Point| (p.0 - at.0).abs() < 0.01 && (p.1 - at.1).abs() < 0.01;
+        let Some(found) = motions.iter().position(|(_, p)| close(*p)) else { motions.clear(); return false };
+        let hover = motions[found].0;
+        motions.drain(..=found);
+        hover
     }
     fn observe_release(&self, buttons: usize, now: Instant, at: (f32, f32)) {
         self.step(Event::Sampled { button_down: buttons & 1 != 0, now, at });
@@ -163,16 +212,6 @@ impl Panel {
         else { OverlaySupport::Supported }
     }
     pub(crate) fn pointer_state(&self) -> std::rc::Rc<PointerState> { self.pointer.clone() }
-    /// Whether the event AppKit is dispatching is `mouseMoved:`, sent only with no button down.
-    pub fn dispatching_hover(&self) -> bool {
-        const MOUSE_MOVED: usize = 5;
-        // SAFETY: winit reports positions on AppKit's main thread; the event is only read here.
-        unsafe {
-            let app: *mut NSObject = msg_send![objc2_app_kit::NSApplication::class(), sharedApplication];
-            let event: *mut NSEvent = msg_send![app, currentEvent];
-            !event.is_null() && { let kind: usize = msg_send![event, type]; kind == MOUSE_MOVED }
-        }
-    }
     pub fn pointer_captured(&self) -> bool { self.pointer.captured() }
     pub fn pointer_released(&self) {
         self.pointer.released();
@@ -279,6 +318,7 @@ impl Panel {
         self.monitors.borrow_mut().take();
         self.pointer.step(Event::Stopped);
         self.pointer.pending.set(None);
+        self.pointer.motions.borrow_mut().clear();
         self.pointer.last.set(None);
         self.pointer.inside.set(false);
         self.pointer.recovered_release.set(None);

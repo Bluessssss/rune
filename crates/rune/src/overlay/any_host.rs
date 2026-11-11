@@ -113,8 +113,7 @@ impl<T: 'static> AnyHost for Overlay<T> {
                 let (x, y) = (position.x as f32 / scale, position.y as f32 / scale);
                 #[cfg(target_os = "macos")]
                 if let Some(pointer) = self.native_pointer() {
-                    let hover = self.panel.as_ref().is_some_and(|p| p.dispatching_hover());
-                    self.native_moved(&pointer, hover, x, y, Instant::now());
+                    self.native_moved(&pointer, x, y, Instant::now());
                     return;
                 }
                 self.cursor_moved(x, y);

@@ -112,7 +112,7 @@ fn overlay_cursor_move_for_the_next_press_cancels_the_old_drag_first() {
     overlay.native_left(&pointer, true, Instant::now());
     pointer.read(0, Instant::now(), (12.0, 10.0), true, false);
     pointer.record_click(true, 50.0, 10.0);
-    overlay.native_moved(&pointer, false, 50.0, 10.0, Instant::now()); // winit reports the click's position just before the click
+    overlay.native_moved(&pointer, 50.0, 10.0, Instant::now()); // winit reports the click's position just before the click
     overlay.native_left(&pointer, true, Instant::now());
     overlay.rt.frame(0.0);
     assert_eq!(overlay.rt.state.iter().filter(|d| d.0 == crate::Phase::Up).map(|d| d.1).collect::<Vec<_>>(), [true]);

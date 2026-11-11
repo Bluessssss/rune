@@ -71,6 +71,7 @@ declare_class!(
         fn send_event(&self, event: &NSEvent) {
             // Without its view the panel would swallow this click and every later one.
             if crate::platform::macos::panel_bridge::reattach(self.as_super()) { eprintln!("rune: panel lost its view; reattached on input"); }
+            pointer::note_motion(self.as_super(), event);
             unsafe { let _: () = msg_send![super(self), sendEvent: event]; }
         }
     }

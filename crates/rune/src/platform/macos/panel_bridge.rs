@@ -228,6 +228,13 @@ pub(crate) fn reattach(panel: &NSPanel) -> bool {
     true
 }
 
+/// The pointer state of `panel`'s view, for an overlay's panel. Runs inside `sendEvent:`.
+pub(crate) fn pointer_state(panel: &NSPanel) -> Option<Rc<crate::platform::macos::PointerState>> {
+    let key = panel as *const NSPanel as usize;
+    let view = WINDOWS.try_with(|w| w.borrow().values().find(|s| s.panel == key).map(|s| s.view)).ok().flatten()?;
+    VIEWS.try_with(|views| views.borrow().get(&view).cloned()).ok().flatten()
+}
+
 /// Whether `reattach` returned `panel`'s view since the last call.
 pub(crate) fn take_reattached(panel: &NSPanel) -> bool {
     LOST.try_with(|lost| lost.borrow_mut().remove(&(panel as *const NSPanel as usize))).unwrap_or(false)

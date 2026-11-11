@@ -111,13 +111,15 @@ impl<T: 'static> Overlay<T> {
         self.release_lost(lost);
     }
 
-    /// winit reported a position on the panel. `hover` when AppKit said no button is down: a
-    /// press still held doesn't hear it, only sees the button up.
+    /// winit reported a position on the panel. From a `mouseMoved:`, sent only with no button
+    /// down, a press still held doesn't hear it, only sees the button up.
     #[cfg(target_os = "macos")]
-    pub(super) fn native_moved(&mut self, pointer: &crate::platform::macos::PointerState, hover: bool, x: f32, y: f32, now: Instant) {
-        let deferred = hover && pointer.hovered(now, (x, y));
+    pub(super) fn native_moved(&mut self, pointer: &crate::platform::macos::PointerState, x: f32, y: f32, now: Instant) {
+        let deferred = pointer.take_motion_hover((x, y)) && pointer.hovered(now, (x, y));
         self.before_position(pointer);
-        if !deferred { self.cursor_moved(x, y); }
+        if deferred { return; }
+        pointer.forget_hover();
+        self.cursor_moved(x, y);
     }
 
     /// winit dispatched a left press or release on the panel.
@@ -149,6 +151,8 @@ impl<T: 'static> Overlay<T> {
     /// it can't end this press, and a late Up can't turn it into a drop.
     #[cfg(target_os = "macos")]
     pub(super) fn left_edge(&mut self, lost: Option<(f32, f32)>, pressed: bool, point: Option<(f32, f32)>) {
+        // Landing moves the runtime to the old release; an unmatched press stays where winit put it.
+        let point = point.or(self.rt.pointer().filter(|_| pressed && lost.is_some()));
         self.release_lost(lost);
         if self.options.input.resolved(self.interactive) != OverlayInput::None { self.left_button(pressed, point); }
     }
