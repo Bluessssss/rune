@@ -111,11 +111,22 @@ impl<T: 'static> Overlay<T> {
         self.release_lost(lost);
     }
 
+    /// winit reported a position on the panel. `hover` when AppKit said no button is down: a
+    /// press still held doesn't hear it, only sees the button up.
+    #[cfg(target_os = "macos")]
+    pub(super) fn native_moved(&mut self, pointer: &crate::platform::macos::PointerState, hover: bool, x: f32, y: f32, now: Instant) {
+        let deferred = hover && pointer.hovered(now, (x, y));
+        self.before_position(pointer);
+        if !deferred { self.cursor_moved(x, y); }
+    }
+
     /// winit dispatched a left press or release on the panel.
     #[cfg(target_os = "macos")]
-    pub(super) fn native_left(&mut self, pointer: &crate::platform::macos::PointerState, pressed: bool) {
+    pub(super) fn native_left(&mut self, pointer: &crate::platform::macos::PointerState, pressed: bool, now: Instant) {
         let (lost, point) = pointer.take_edge(pressed);
         self.left_edge(lost, pressed, point);
+        // One the monitor never saw still needs its Up noticed if that's lost.
+        if pressed && point.is_none() && self.rt.pointer_captured() && let Some(at) = self.rt.pointer() { pointer.unseen_press(at, now); }
     }
 
     /// A turn's pointer work once the panel has sampled: the position to report, if any.

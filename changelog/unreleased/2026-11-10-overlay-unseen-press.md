@@ -1,0 +1,1 @@
+- A press on a macOS overlay that arrives before the panel's mouse monitors are running now ends as a cancelled drag (`Phase::Up` with `Drag::cancelled`) if its release is lost, instead of staying held. The overlay reads the button every 100 ms during such a press and no longer reports sampled positions to the drag once the button reads up; its normal click is unchanged.

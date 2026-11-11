@@ -1,0 +1,1 @@
+- A held drag on a macOS overlay no longer hears `mouseMoved:` hover made after its release was lost: the move starts the release's grace and reaches the overlay once the drag has ended. Moves made with the button down reach the drag as before.

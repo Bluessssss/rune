@@ -110,9 +110,14 @@ impl<T: 'static> AnyHost for Overlay<T> {
             }
             WindowEvent::CursorMoved { position, .. } if self.options.input.resolved(self.interactive) != OverlayInput::None => {
                 let scale = self.live.as_ref().map_or(1.0, |l| l.scale);
+                let (x, y) = (position.x as f32 / scale, position.y as f32 / scale);
                 #[cfg(target_os = "macos")]
-                if let Some(pointer) = self.native_pointer() { self.before_position(&pointer); }
-                self.cursor_moved(position.x as f32 / scale, position.y as f32 / scale);
+                if let Some(pointer) = self.native_pointer() {
+                    let hover = self.panel.as_ref().is_some_and(|p| p.dispatching_hover());
+                    self.native_moved(&pointer, hover, x, y, Instant::now());
+                    return;
+                }
+                self.cursor_moved(x, y);
             }
             WindowEvent::CursorLeft { .. } if self.options.input.resolved(self.interactive) != OverlayInput::None => {
                 self.rt.pointer_leave();
@@ -145,7 +150,7 @@ impl<T: 'static> AnyHost for Overlay<T> {
                 #[cfg(target_os = "macos")]
                 {
                     match self.native_pointer() {
-                        Some(pointer) => self.native_left(&pointer, state.is_pressed()),
+                        Some(pointer) => self.native_left(&pointer, state.is_pressed(), Instant::now()),
                         None => self.left_edge(None, state.is_pressed(), None),
                     }
                     if !state.is_pressed() && let Some(panel) = &self.panel { panel.pointer_released(); }
