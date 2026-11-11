@@ -1,5 +1,6 @@
 //! Embedded `CAMetalLayer` host for UIKit, SwiftUI and AppKit views that own their own window
-//! and event loop (e.g. a `UIViewRepresentable` driven by `CADisplayLink` on iOS).
+//! and event loop (e.g. a `UIViewRepresentable` driven by `CADisplayLink` on iOS), and the same
+//! host on an Android `Surface` (a `SurfaceView` driven by `Choreographer`).
 
 use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
@@ -51,7 +52,8 @@ pub struct EmbedFrame {
 /// acquisition and command-buffer submission after `didEnterBackground`.
 pub struct LayerHost<S: 'static> {
     gpu: Arc<Gpu>,
-    surface: wgpu::Surface<'static>,
+    /// `None` while Android has taken the `Surface` away (the app is in the background).
+    surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
     compositor: Option<Box<dyn Compositor<S>>>,
@@ -67,6 +69,7 @@ impl<S: 'static> LayerHost<S> {
     /// # Safety
     /// `layer` must be a valid `CAMetalLayer` pointer that outlives this `LayerHost`, and surface
     /// creation / presentation must run on a thread allowed to touch that layer (the UI thread).
+    #[cfg(target_vendor = "apple")]
     pub unsafe fn from_core_animation_layer(
         layer: *mut c_void,
         spec: &AppSpec<S>,
@@ -79,19 +82,64 @@ impl<S: 'static> LayerHost<S> {
         if layer.is_null() {
             return Err("null CAMetalLayer pointer".into());
         }
+        unsafe { Self::attach(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer), spec, state, viewport, scale, dark, wake) }
+    }
+
+    /// [`from_core_animation_layer`](Self::from_core_animation_layer) for an Android
+    /// `ANativeWindow *` (`ANativeWindow_fromSurface`).
+    ///
+    /// # Safety
+    /// `window` must be a valid `ANativeWindow` pointer until [`set_android_native_window`](Self::set_android_native_window)
+    /// replaces it or this `LayerHost` is dropped: call that with null from `surfaceDestroyed`.
+    #[cfg(target_os = "android")]
+    pub unsafe fn from_android_native_window(
+        window: *mut c_void,
+        spec: &AppSpec<S>,
+        state: S,
+        viewport: (f32, f32),
+        scale: f32,
+        dark: bool,
+        wake: Waker,
+    ) -> Result<Self, String> {
+        let target = android_target(window).ok_or("null ANativeWindow pointer")?;
+        unsafe { Self::attach(target, spec, state, viewport, scale, dark, wake) }
+    }
+
+    /// Draws into `window` from now on, keeping the runtime; null drops the surface, and frames
+    /// draw nothing until the next window. Android destroys an app's `Surface` whenever it
+    /// leaves the foreground.
+    ///
+    /// # Safety
+    /// As [`from_android_native_window`](Self::from_android_native_window).
+    #[cfg(target_os = "android")]
+    pub unsafe fn set_android_native_window(&mut self, window: *mut c_void) -> Result<(), String> {
+        // The old swapchain goes before a new one is made on what may be the same window.
+        self.surface = None;
+        let Some(target) = android_target(window) else { return Ok(()) };
+        let surface = unsafe { self.gpu.instance.create_surface_unsafe(target).map_err(|e| format!("create_surface_unsafe: {e}"))? };
+        surface.configure(&self.gpu.device, &self.config);
+        self.surface = Some(surface);
+        Ok(())
+    }
+
+    unsafe fn attach(
+        target: wgpu::SurfaceTargetUnsafe,
+        spec: &AppSpec<S>,
+        state: S,
+        viewport: (f32, f32),
+        scale: f32,
+        dark: bool,
+        wake: Waker,
+    ) -> Result<Self, String> {
         let gpu = shared_gpu()?;
-        let surface = unsafe {
-            gpu.instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
-                .map_err(|e| format!("create_surface_unsafe: {e}"))?
-        };
+        let surface = unsafe { gpu.instance.create_surface_unsafe(target).map_err(|e| format!("create_surface_unsafe: {e}"))? };
         let scale = scale.max(1.0);
         let max_dim = gpu.device.limits().max_texture_dimension_2d.max(1);
         let px_w = ((viewport.0.max(1.0) * scale).round() as u32).clamp(1, max_dim);
         let px_h = ((viewport.1.max(1.0) * scale).round() as u32).clamp(1, max_dim);
         let srgb_blend = true;
         let (config, _) = crate::window::surface_config(&surface, &gpu.adapter, (px_w, px_h), srgb_blend)
-            .ok_or_else(|| "CAMetalLayer has no supported wgpu surface configuration".to_owned())?;
+            .ok_or_else(|| "the surface has no supported wgpu configuration".to_owned())?;
         surface.configure(&gpu.device, &config);
         let target_format = config.format.remove_srgb_suffix();
         let mut renderer = Renderer::new(&gpu.device, target_format);
@@ -108,7 +156,7 @@ impl<S: 'static> LayerHost<S> {
 
         Ok(Self {
             gpu,
-            surface,
+            surface: Some(surface),
             config,
             renderer,
             compositor: None,
@@ -149,7 +197,7 @@ impl<S: 'static> LayerHost<S> {
         if self.config.width != px_w || self.config.height != px_h {
             self.config.width = px_w;
             self.config.height = px_h;
-            self.surface.configure(&self.gpu.device, &self.config);
+            if let Some(surface) = &self.surface { surface.configure(&self.gpu.device, &self.config); }
         }
         self.rt.set_viewport((px_w as f32 / scale, px_h as f32 / scale), scale);
     }
@@ -159,6 +207,7 @@ impl<S: 'static> LayerHost<S> {
         if self.suspended {
             return EmbedFrame::default();
         }
+        let Some(surface) = &self.surface else { return EmbedFrame::default() };
         let t0 = Instant::now();
         let (animating, dt) = self.clock.advance(&mut self.rt, t0, false);
         let update_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -169,10 +218,10 @@ impl<S: 'static> LayerHost<S> {
         self.rt.refuse_file_dialog("native file dialogs are unsupported in embedded views");
 
         let comp_animating = self.compositor.as_ref().is_some_and(|c| c.animating());
-        let frame = match self.surface.get_current_texture() {
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.gpu.device, &self.config);
+                surface.configure(&self.gpu.device, &self.config);
                 return EmbedFrame { animating: true, ..EmbedFrame::default() };
             }
             _ => return EmbedFrame { animating: animating || comp_animating, ..EmbedFrame::default() },
@@ -227,6 +276,15 @@ impl<S: 'static> LayerHost<S> {
             cpu_us,
         }
     }
+}
+
+#[cfg(target_os = "android")]
+fn android_target(window: *mut c_void) -> Option<wgpu::SurfaceTargetUnsafe> {
+    use winit::raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle};
+    Some(wgpu::SurfaceTargetUnsafe::RawHandle {
+        raw_display_handle: Some(AndroidDisplayHandle::new().into()),
+        raw_window_handle: AndroidNdkWindowHandle::new(std::ptr::NonNull::new(window)?).into(),
+    })
 }
 
 #[cfg(all(test, target_os = "macos"))]

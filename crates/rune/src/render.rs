@@ -554,6 +554,10 @@ impl Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends;
         descriptor.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        // A debug build names its Vulkan objects, and the Android emulator's driver crashes on
+        // the first name (a null dereference in its vk_common_SetDebugUtilsObjectNameEXT).
+        #[cfg(target_os = "android")]
+        descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
         // An HWND's DXGI swapchain is opaque only; DirectComposition composites alpha on every GPU.
         descriptor.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
         // FXC ships with Windows (d3dcompiler_47.dll in System32). wgpu's default looks for
