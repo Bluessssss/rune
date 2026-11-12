@@ -207,6 +207,9 @@ fn walk_font_dirs() -> Vec<(String, std::path::PathBuf)> {
         }
     } else if cfg!(target_os = "ios") {
         dirs.push("/System/Library/Fonts".into());
+    } else if cfg!(target_os = "android") {
+        // Noto Color Emoji and the symbol fonts; Android has no XDG directories.
+        dirs.extend(["/system/fonts", "/product/fonts"].map(Into::into));
     } else if cfg!(windows) {
         let root = std::env::var_os("WINDIR").map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from);
         dirs.push(root.join("Fonts"));
