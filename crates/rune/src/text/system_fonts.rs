@@ -22,8 +22,12 @@ pub(super) const SYMBOL_FONT_FILES: &[&str] = &["seguisym", "seguiemj"];
 #[cfg(not(any(target_vendor = "apple", windows)))]
 pub(super) const SYMBOL_FAMILIES: &[&str] =
     &["DejaVu Sans", "Noto Sans Symbols2", "Noto Sans Symbols", "DejaVu Sans Mono", "Noto Color Emoji"];
-#[cfg(not(any(target_vendor = "apple", windows)))]
+#[cfg(not(any(target_vendor = "apple", windows, target_os = "android")))]
 pub(super) const SYMBOL_FONT_FILES: &[&str] = &["dejavusans", "notosanssymbols", "notocoloremoji"];
+// Android 13 and later ship Noto Color Emoji as COLRv1, which Rune doesn't draw; an app brings its
+// own bitmap copy through `AppSpec::fonts`, and the system's file of the same family stays out.
+#[cfg(target_os = "android")]
+pub(super) const SYMBOL_FONT_FILES: &[&str] = &["dejavusans", "notosanssymbols"];
 
 // `Family::SystemMono`: the platform's monospaced UI families, most preferred first, and the
 // files they're in. SF Mono's family name is `.SF NS Mono`, as SF's is `.SF NS`.
