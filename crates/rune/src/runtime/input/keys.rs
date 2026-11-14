@@ -211,6 +211,14 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Whether the focused field has an input method composition (preedit) open.
+    /// The focused field's open composition, if any.
+    pub(super) fn preedit_text(&mut self) -> Option<String> {
+        let access = self.focused_input()?.access.clone();
+        match access {
+            Some(access) => access(states!(self)).preedit.as_ref().map(|p| p.0.clone()),
+            None => self.focused_input().and_then(|i| i.edit.preedit.as_ref().map(|p| p.0.clone())),
+        }
+    }
     pub(super) fn composing(&mut self) -> bool {
         let Some(access) = self.focused_input().map(|i| i.access.clone()) else { return self.app_ime.composing() };
         match access {
@@ -277,9 +285,10 @@ impl<S: 'static> Runtime<S> {
         self.queue.push(Action::Ime(ev));
     }
 
-    /// End native composition on window deactivation without discarding text or field focus.
+    /// End native composition on window deactivation without discarding text or field focus:
+    /// what the focused field was composing is confirmed, as a browser does on blur.
     pub fn cancel_composition(&mut self) {
-        self.ime(Ime::Preedit(String::new(), None));
+        self.queue.push(Action::EndComposition);
         self.ime_reset = true;
     }
 

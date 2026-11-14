@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn window_blur_cancels_preedit_without_losing_committed_text_or_focus() {
+    fn window_blur_confirms_preedit_without_losing_committed_text_or_focus() {
         fn view(s: &crate::TextEdit, _: &mut Cx<crate::TextEdit>) -> El {
             crate::text_input(s, crate::TextStyle::new(14.0, 400.0)).key("field").size(200.0, 40.0)
                 .on_edit(|s: &mut crate::TextEdit| s)
@@ -565,7 +565,7 @@ mod tests {
         rt.ime_reset = false;
         rt.cancel_composition(); rt.frame(0.0);
         assert!(rt.state.preedit.is_none() && rt.state.focused && rt.ime_reset);
-        assert_eq!(rt.state.text, "committed");
+        assert_eq!(rt.state.text, "committedpending");
     }
 
     #[test]
