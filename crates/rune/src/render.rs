@@ -57,8 +57,9 @@ pub const KIND_RADIAL: f32 = 11.0;
 /// `rect` in device pixels and `params.w` the slot's scale in device pixels per point (`Env::scale`
 /// times any element or ancestor `scale` / `live_scale`). `fill[3]` is always 1: a faded slot is
 /// drawn in an isolated layer that applies its opacity. `border[0]` and `border[1]` hold the low
-/// and high 16 bits of its `El::effect` tag as exact floats (`EffectSite::mark`), and `uv` its
-/// `El::effect_data` payload, bit for bit (`EffectSite::data`).
+/// and high 16 bits of its `El::effect` tag as exact floats (`EffectSite::mark`), `border[2]` the
+/// backdrop reach past `rect` in device pixels (`El::effect_backdrop_reach`, 0 for the whole
+/// target), and `uv` its `El::effect_data` payload, bit for bit (`EffectSite::data`).
 pub const KIND_EFFECT: f32 = 12.0;
 /// A backdrop blur (`El::backdrop_blur`). Like an effect slot it rasterizes nothing itself in
 /// the uber shader; the renderer stops there, copies and blurs what is below, and draws the blur
@@ -151,7 +152,8 @@ pub struct EffectSite<'a> {
     /// holding sRGB-encoded premultiplied values when `srgb_blend` is true; pass it directly to
     /// `FxRenderer::blur_backdrop` or `FxRenderer::set_layer_backdrop`). Inside an isolated layer
     /// (`in_layer: true`), holds that layer's offscreen target copied at `origin` in window
-    /// coordinates.
+    /// coordinates. Outside a layer, a slot with `El::effect_backdrop_reach` has only its rect
+    /// and that reach copied; the rest holds what the texture held before.
     pub backdrop: Option<&'a wgpu::TextureView>,
 }
 

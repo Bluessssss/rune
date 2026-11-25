@@ -8,6 +8,8 @@ pub(crate) struct EffectSlot {
     pub bleed: f32,
     /// Asks for a backdrop copy (`El::effect_backdrop`).
     pub backdrop: bool,
+    /// Points past the rect the backdrop copy needs, 0 for all of it (`El::effect_backdrop_reach`).
+    pub reach: f32,
     /// The app's payload (`El::effect_data`).
     pub data: [f32; 4],
 }
@@ -15,7 +17,7 @@ pub(crate) struct EffectSlot {
 impl PartialEq for EffectSlot {
     // Bitwise, so a NaN-packed payload still lets a memoized row be reused.
     fn eq(&self, o: &Self) -> bool {
-        self.bleed == o.bleed && self.backdrop == o.backdrop && self.data.map(f32::to_bits) == o.data.map(f32::to_bits)
+        self.bleed == o.bleed && self.backdrop == o.backdrop && self.reach == o.reach && self.data.map(f32::to_bits) == o.data.map(f32::to_bits)
     }
 }
 
@@ -57,6 +59,15 @@ impl El {
     /// A target without `COPY_SRC` usage can't be copied: the slot draws in the open pass with `backdrop == None`.
     pub fn effect_backdrop(mut self, on: bool) -> Self {
         self.vis.cold_mut().effect.get_or_insert_with(EffectSlot::default).backdrop = on;
+        self
+    }
+    /// Points past the slot's rect that its compositor reads of the backdrop (a blur's reach).
+    /// The copy then covers only that window of the target instead of all of it, so a frame
+    /// with many backdrop slots doesn't move a whole frame's pixels for each. Pixels outside it
+    /// hold whatever the pooled backdrop held before. 0 (the default) copies the whole target,
+    /// as does a slot inside an isolated layer.
+    pub fn effect_backdrop_reach(mut self, pt: f32) -> Self {
+        self.vis.cold_mut().effect.get_or_insert_with(EffectSlot::default).reach = pt.max(0.0);
         self
     }
     /// Four floats this effect slot hands its compositor as `EffectSite::data`, such as which

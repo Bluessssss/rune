@@ -13,7 +13,7 @@ pub(super) fn push_effect(instances: &mut Vec<Instance>, (effect, mark): (crate:
         rect,
         radii,
         fill: [0.0, 0.0, 0.0, 1.0],
-        border: [(mark & 0xFFFF) as f32, (mark >> 16) as f32, 0.0, 0.0],
+        border: [(mark & 0xFFFF) as f32, (mark >> 16) as f32, effect.reach * k_px, 0.0],
         params: [if effect.backdrop { 1.0 } else { 0.0 }, KIND_EFFECT, effect.bleed * k_px, k_px],
         uv: effect.data,
         clip,

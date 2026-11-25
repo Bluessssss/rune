@@ -108,3 +108,13 @@ fn backdrop_slot_degrades_when_the_target_cannot_be_copied() {
     assert!(error.is_none(), "{error:?}");
     assert_eq!(draws, 1);
 }
+
+#[test]
+fn a_backdrop_reach_copies_only_the_window_the_slot_reads() {
+    let mut slot = rect([10.0, 20.0, 30.0, 40.0], [0.0, 0.0, 0.0, 1.0]);
+    slot.params = [1.0, KIND_EFFECT, 0.0, 2.0];
+    assert_eq!(pass::backdrop_window(&slot, false), None, "no reach copies the whole target");
+    slot.border[2] = 8.0;
+    assert_eq!(pass::backdrop_window(&slot, false), Some([2.0, 12.0, 48.0, 68.0]));
+    assert_eq!(pass::backdrop_window(&slot, true), None, "a slot in a layer copies all of the layer");
+}

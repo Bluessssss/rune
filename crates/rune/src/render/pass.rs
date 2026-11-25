@@ -60,7 +60,7 @@ impl<'a, 'p> ActivePass<'a, 'p> {
         in_layer: bool,
         hook: &mut EffectBackdropHook<'_>,
     ) -> Option<&'r wgpu::TextureView> {
-        let bd = self.split(renderer, format, origin, size, in_layer, None, |encoder, bd| {
+        let bd = self.split(renderer, format, origin, size, in_layer, backdrop_window(instance, in_layer), |encoder, bd| {
             let site = EffectSite {
                 index: at,
                 instance,
@@ -222,4 +222,15 @@ impl Renderer {
             self.backdrops.push(Backdrop { format, texture, view });
         }
     }
+}
+
+/// The window device-pixel rect an effect slot's backdrop copy covers: its rect grown by its
+/// reach (`El::effect_backdrop_reach`), or `None` for the whole target. A slot in an isolated
+/// layer can sit in turned coordinates, so it keeps the whole (layer-sized) copy.
+pub(super) fn backdrop_window(instance: &Instance, in_layer: bool) -> Option<[f32; 4]> {
+    let reach = instance.border[2];
+    (reach > 0.0 && !in_layer).then(|| {
+        let [x, y, w, h] = instance.rect;
+        [x - reach, y - reach, x + w + reach, y + h + reach]
+    })
 }
