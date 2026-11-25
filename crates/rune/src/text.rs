@@ -441,6 +441,9 @@ impl TextSystem {
         wrap_anywhere: bool,
         cache: bool,
     ) -> Rc<Layout<Ink>> {
+        // A box sized to its text gets that width back through padding and fractional zoom a
+        // hair short; half a device pixel of slack keeps the line it was measured as whole.
+        let max_width = max_width.map(|w| w + 0.5);
         self.follow_language();
         let shared = (!cache).then(|| std::mem::replace(&mut self.layout_cx, LayoutContext::new()));
         let has_indented_blocks = blocks.iter().any(|&b| b != crate::edit::Block::Paragraph);
