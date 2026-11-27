@@ -1,0 +1,1 @@
+- Apps can present their own context menu for selectable text and editors, with live editing, rich clipboard support, and secure-field protections.

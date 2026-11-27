@@ -37,6 +37,7 @@ pub struct Tx {
     pub(crate) window_step: bool,
     pub(crate) copy: Option<crate::ClipboardWrite>,
     pub(crate) paste: bool,
+    pub(crate) edit_context: Vec<crate::text_context::Request>,
     pub(crate) clipboard_reads: Vec<ClipboardRead>,
     pub(crate) pick_reads: Vec<PickRead>,
     pub(crate) clear_secret: bool,
@@ -150,7 +151,7 @@ impl Tx {
     /// Work only a frame carries out that changes its pixels without a model change: a scroll
     /// or a text flight. A `wake_after` only schedules.
     pub(crate) fn frame_work(&self) -> bool {
-        !self.pick_reads.is_empty() || !self.scroll_to.is_empty() || !self.scroll_bottom.is_empty() || !self.scroll_pages.is_empty() || !self.scroll_offsets.is_empty()
+        !self.pick_reads.is_empty() || !self.edit_context.is_empty() || !self.scroll_to.is_empty() || !self.scroll_bottom.is_empty() || !self.scroll_pages.is_empty() || !self.scroll_offsets.is_empty()
             || !self.keep_on_screen.is_empty() || !self.text_flights.is_empty() || !self.launches.is_empty() || self.select.is_some()
     }
 

@@ -283,6 +283,8 @@ fn same_handlers(
         on_press,
         on_double_press,
         on_secondary_press,
+        on_text_context,
+        no_text_context,
         on_hover,
         on_hover_change,
         hover_delay,
@@ -320,6 +322,8 @@ fn same_handlers(
         && opt_rc_eq(&a.on_press, on_press)
         && opt_rc_eq(&a.on_double_press, on_double_press)
         && opt_rc_eq(&a.on_secondary_press, on_secondary_press)
+        && opt_rc_eq(&a.on_text_context, on_text_context)
+        && a.no_text_context == *no_text_context
         && opt_rc_eq(&a.on_hover, on_hover)
         && opt_rc_eq(&a.on_hover_change, on_hover_change)
         && a.hover_delay == *hover_delay

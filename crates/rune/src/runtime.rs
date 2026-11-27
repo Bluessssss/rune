@@ -185,6 +185,8 @@ mod hot_state;
 mod props;
 #[path = "runtime/input/secondary.rs"]
 mod secondary;
+#[path = "runtime/input/text_context.rs"]
+mod text_context;
 #[path = "runtime/input/app_ime.rs"]
 mod app_ime;
 #[path = "runtime/input/press_clicks.rs"]

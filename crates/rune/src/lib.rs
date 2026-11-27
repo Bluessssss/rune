@@ -26,6 +26,7 @@ mod recorder;
 mod shortcuts;
 mod states;
 mod system_material;
+mod text_context;
 mod video;
 mod window;
 
@@ -297,6 +298,8 @@ pub use text::LinkPaint;
 pub use text::Span;
 pub use text::TextCase;
 pub use text::TextHighlight;
+pub use text_context::TextCommand;
+pub use text_context::TextContext;
 pub use theme::Theme;
 pub use tok::Family;
 pub use tok::OpticalSize;

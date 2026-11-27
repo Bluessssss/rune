@@ -14,6 +14,7 @@ impl<S: 'static> Runtime<S> {
             let n = &self.nodes[index];
             if self.subtree_exiting(index) || !self.allowed(index) { break; }
             if n.handlers.on_secondary_press.is_some() || self.secondary_link_at(index, x, y).is_some() { return Some(&n.path); }
+            if self.is_context_input(index) && self.has_text_context(index) { return Some(&n.path); }
             if text.is_none() && self.is_selectable(index) { text = Some(n.path.as_str()); }
             let Some(p) = n.parent else { break };
             index = p;
@@ -45,6 +46,9 @@ impl<S: 'static> Runtime<S> {
             // onto, off or between links opens nothing.
             match (link, down_link) {
                 (Some(k), Some(d)) if k == d => self.queue.push(Action::LinkSecondary(path, k, point)),
+                (None, None) if i.is_some_and(|i| self.nodes[i].handlers.on_secondary_press.is_none() && self.has_text_context(i)) => {
+                    self.queue.push(Action::TextContext(path, point, true));
+                }
                 (None, None) if !self.selection_menu(&path, x, y) => self.queue.push(Action::SecondaryPress(path, point)),
                 _ => {}
             }
@@ -67,6 +71,13 @@ impl<S: 'static> Runtime<S> {
         let Some(focused) = self.focused_index().filter(|&i| menu_key && self.can_focus(i)) else { return false };
         if self.focused_link_menu(focused, tx) { return true; }
         let [x, _, _, y] = self.drawn_box(focused);
+        if self.nodes[focused].handlers.on_secondary_press.is_none()
+            && self.is_context_input(focused) && self.has_text_context(focused)
+        {
+            let path = self.nodes[focused].path.clone();
+            let point = self.pointer_event(focused, x, y);
+            return self.open_text_context(&path, point, false, tx);
+        }
         let mut index = focused;
         loop {
             let n = &self.nodes[index];
@@ -78,8 +89,12 @@ impl<S: 'static> Runtime<S> {
                 f(states!(self), point, tx);
                 return true;
             }
-            let Some(p) = n.parent else { return false };
+            let Some(p) = n.parent.filter(|&p| self.allowed(p)) else { break };
             index = p;
         }
+        if !self.has_text_context(focused) { return false; }
+        let path = self.nodes[focused].path.clone();
+        let point = self.pointer_event(focused, x, y);
+        self.open_text_context(&path, point, false, tx)
     }
 }

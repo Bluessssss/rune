@@ -718,17 +718,7 @@ impl<S: 'static> Runtime<S> {
     pub(super) fn selection_menu(&mut self, path: &str, x: f32, y: f32) -> bool {
         let Some(i) = self.live(path) else { return false };
         if !self.is_selectable(i) || self.nodes[i].handlers.on_secondary_press.is_some() { return false; }
-        if let Some(at) = self.text_index_at(i, x, y)
-            && range_in(&self.selection_ranges(), i).is_none_or(|(a, b)| at < a || at >= b)
-        {
-            let content = self.content_of(i).to_owned();
-            let (a, b) = self.unit_in(i, at, Unit::Word);
-            self.text_sel = Held { path: Some(path.to_owned()), content, anchor: a, focus: b, far: None,
-                anchor_end: None, focus_end: None, mounted_between: HashMap::default(), between: 0,
-                unit: Unit::Word, origin: (a, b), dragging: false, last: None, shift: self.text_sel.shift,
-                pick: std::mem::take(&mut self.text_sel.pick) };
-            self.seal_between();
-        }
+        self.select_word_for_menu(i, x, y);
         let text = self.copy_text();
         let mut copy = crate::PopupItem::new("copy", "Copy").enabled(text.is_some());
         if let Ok(shortcut) = "cmd+c".parse::<crate::Shortcut>() { copy = copy.key_equivalent(shortcut); }
@@ -741,6 +731,20 @@ impl<S: 'static> Runtime<S> {
             }),
         });
         true
+    }
+
+    pub(super) fn select_word_for_menu(&mut self, i: usize, x: f32, y: f32) {
+        if let Some(at) = self.text_index_at(i, x, y)
+            && range_in(&self.selection_ranges(), i).is_none_or(|(a, b)| at < a || at >= b)
+        {
+            let content = self.content_of(i).to_owned();
+            let (a, b) = self.unit_in(i, at, Unit::Word);
+            self.text_sel = Held { path: Some(self.nodes[i].path.clone()), content, anchor: a, focus: b, far: None,
+                anchor_end: None, focus_end: None, mounted_between: HashMap::default(), between: 0,
+                unit: Unit::Word, origin: (a, b), dragging: false, last: None, shift: self.text_sel.shift,
+                pick: std::mem::take(&mut self.text_sel.pick) };
+            self.seal_between();
+        }
     }
 }
 

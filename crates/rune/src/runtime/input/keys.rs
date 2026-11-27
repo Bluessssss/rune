@@ -59,21 +59,7 @@ impl<S: 'static> Runtime<S> {
             _ => !ev.is_command_chord() || ev.control_binding().is_some(),
         };
         if input_handles {
-            let layout = self.focused_layout();
-            // A rich field copies its selection's formatting too, read before a cut removes it.
-            let mut html = None;
-            let copies = matches!(ev.key, crate::edit::Key::Command('c' | 'x'));
-            let handled = self.with_focused(|e| {
-                if copies && e.is_rich() && !e.is_secure() {
-                    html = Some(e.selected_html()).filter(|h| !h.is_empty());
-                }
-                e.key(ev, layout.as_deref())
-            }, one);
-            if let Some(html) = html
-                && let Some(text) = one.copy.as_ref().filter(|w| !w.is_secret()).map(|w| w.content().text().to_owned())
-            {
-                one.copy_rich(crate::ClipboardContent::new(text).with_html(html));
-            }
+            let handled = self.edit_key(ev, one);
             if handled { return true; }
         }
         one.physical_key = physical_key;
@@ -160,6 +146,61 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn with_focused(&mut self, f: impl FnOnce(&mut crate::edit::TextEdit) -> EditOutcome, tx: &mut Tx) -> bool {
         self.with_focused_state(|state, access, _| f(access(state)), tx)
+    }
+
+    /// The field's editing commands, shared by keys and the default context menu.
+    pub(super) fn edit_key(&mut self, ev: &KeyEvent, one: &mut Tx) -> bool {
+        let layout = self.focused_layout();
+        // A rich field copies its selection's formatting too, read before a cut removes it.
+        let mut html = None;
+        let copies = matches!(ev.key, crate::edit::Key::Command('c' | 'x'));
+        let handled = self.with_focused(|e| {
+            if copies && e.is_rich() && !e.is_secure() {
+                html = Some(e.selected_html()).filter(|h| !h.is_empty());
+            }
+            e.key(ev, layout.as_deref())
+        }, one);
+        if let Some(html) = html
+            && let Some(text) = one.copy.as_ref().filter(|w| !w.is_secret()).map(|w| w.content().text().to_owned())
+        {
+            one.copy_rich(crate::ClipboardContent::new(text).with_html(html));
+        }
+        handled
+    }
+
+    /// Applies paste to the focused editor, with the same hooks and rich formats as a key paste.
+    pub(super) fn apply_paste(&mut self, content: crate::ClipboardContent, tx: &mut Tx) -> bool {
+        let hook = self.focused_input().and_then(|i| i.paste.clone());
+        let own_pills = if cfg!(not(target_arch = "wasm32")) || self.clipboard.is_some() {
+            content.has_own_pills()
+        } else {
+            self.pill_copy.as_ref().is_some_and(|(t, pills)| {
+                t.as_str() == content.text()
+                    && content.html().is_some_and(|h| {
+                        let frag = crate::TextEdit::from_html(h);
+                        frag.pills().count() == pills.len()
+                            && frag.pills().zip(pills).all(|((r1, id1), (r2, id2))| r1 == *r2 && id1 == id2)
+                    })
+            })
+        };
+        let into_field = |mut state: crate::states::States<'_>, access: &crate::el::EditFn, tx: &mut Tx| {
+            if hook.is_some_and(|hook| hook(state.reborrow(), &content, tx)) { return EditOutcome::default(); }
+            let edit = access(state);
+            // A rich field keeps the paste's formatting. The HTML was sanitised when it
+            // was read, and `from_html` keeps only its own safe subset anyway.
+            if let Some(html) = content.html() && edit.is_rich() && !edit.is_secure() {
+                return if own_pills { edit.paste_html_with_pills(html, content.text()) } else { edit.paste_html(html, content.text()) };
+            }
+            if !content.has_plain() { return EditOutcome::default(); }
+            edit.paste(content.text())
+        };
+        if self.with_focused_state(into_field, tx) {
+            log_event!(self, "paste field");
+            true
+        } else if let Some(f) = self.app_paste_handler() && (f.call)(states!(self), &content, tx) {
+            log_event!(self, "paste window");
+            true
+        } else { false }
     }
 
     /// [`Self::with_focused`] for an edit that needs the app state (an app's paste hook).

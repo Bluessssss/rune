@@ -28,6 +28,8 @@ pub(super) enum Action {
     /// `El::on_link_secondary`: the text, its link and the press.
     LinkSecondary(String, usize, PointerEvent),
     SecondaryPress(String, PointerEvent),
+    TextContext(String, PointerEvent, bool),
+    EditText(crate::text_context::Request),
     Drag(String, Drag, crate::PointerButton),
     /// A held press's drag hearing the pointer again (`Tx::drag_repeat_after`).
     DragRepeat(String, Drag, crate::PointerButton),
@@ -174,6 +176,7 @@ fn stall_path(action: &Action) -> Option<&str> {
 pub(super) fn merge(tx: &mut Tx, one: Tx) {
     tx.pick_reads.extend(one.pick_reads);
     tx.paste |= one.paste;
+    tx.edit_context.extend(one.edit_context);
     tx.clipboard_reads.extend(one.clipboard_reads);
     if let Some(one) = one.trace {
         let trace = tx.trace.get_or_insert_with(Default::default);
@@ -400,6 +403,8 @@ impl<S: 'static> Runtime<S> {
                 f(states!(self), point, &mut one);
                 true
             }
+            Action::TextContext(path, point, select_word) => self.open_text_context(&path, point, select_word, &mut one),
+            Action::EditText(request) => self.run_edit_context(request, &mut one),
             Action::Drag(path, mut d, button) | Action::DragRepeat(path, mut d, button) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.on_drag.clone()) else { return false };
                 if d.phase == Phase::Move {
@@ -445,37 +450,7 @@ impl<S: 'static> Runtime<S> {
             }
             Action::Paste(content, target) => {
                 if target.is_some_and(|target| target != self.paste_target()) { return false; }
-                let hook = self.focused_input().and_then(|i| i.paste.clone());
-                let own_pills = if cfg!(not(target_arch = "wasm32")) || self.clipboard.is_some() {
-                    content.has_own_pills()
-                } else {
-                    self.pill_copy.as_ref().is_some_and(|(t, pills)| {
-                        t.as_str() == content.text()
-                            && content.html().is_some_and(|h| {
-                                let frag = crate::TextEdit::from_html(h);
-                                frag.pills().count() == pills.len()
-                                    && frag.pills().zip(pills).all(|((r1, id1), (r2, id2))| r1 == *r2 && id1 == id2)
-                            })
-                    })
-                };
-                let into_field = |mut state: crate::states::States<'_>, access: &crate::el::EditFn, tx: &mut Tx| {
-                    if hook.is_some_and(|hook| hook(state.reborrow(), &content, tx)) { return EditOutcome::default(); }
-                    let edit = access(state);
-                    // A rich field keeps the paste's formatting. The HTML was sanitised when it
-                    // was read, and `from_html` keeps only its own safe subset anyway.
-                    if let Some(html) = content.html() && edit.is_rich() && !edit.is_secure() {
-                        return if own_pills { edit.paste_html_with_pills(html, content.text()) } else { edit.paste_html(html, content.text()) };
-                    }
-                    if !content.has_plain() { return EditOutcome::default(); }
-                    edit.paste(content.text())
-                };
-                if self.with_focused_state(into_field, &mut one) {
-                    log_event!(self, "paste field");
-                    true
-                } else if let Some(f) = self.app_paste_handler() && (f.call)(states!(self), &content, &mut one) {
-                    log_event!(self, "paste window");
-                    true
-                } else { false }
+                self.apply_paste(content, &mut one)
             }
             Action::ClipboardRead(id, content) => {
                 let Some(i) = self.clipboard_reads.iter().position(|(read, _)| *read == id) else { return false };

@@ -15,6 +15,8 @@ pub(crate) struct Handlers {
     pub on_press: Option<PressFn>,
     pub on_double_press: Option<PressFn>,
     pub on_secondary_press: Option<PointerFn>,
+    pub on_text_context: Option<crate::text_context::Handler>,
+    pub no_text_context: bool,
     pub on_hover: Option<PressFn>,
     pub on_hover_change: Option<WindowFocusFn>,
     /// Seconds the pointer must stay inside, then outside, before `on_hover_change` hears it.
@@ -95,6 +97,8 @@ impl Empty for Handlers {
         on_press: None,
         on_double_press: None,
         on_secondary_press: None,
+        on_text_context: None,
+        no_text_context: false,
         on_hover: None,
         on_hover_change: None,
         hover_delay: [0.0; 2],
